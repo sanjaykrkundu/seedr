@@ -3,164 +3,102 @@ const https = require('https');
 const fs = require('fs');
 const { Readable } = require('stream');
 
-class DownloadPool {
-    constructor(poolSize) {
-        this.poolSize = poolSize;
-        this.activeDownloads = 0;
-        this.taskQueue = [];
-        this.progress = {}; // Progress information for each ongoing download
-        this.cursorPositions = {}; // Cursor position for each ongoing download
-    }
+// Function to download a file from a URL with support for following redirects
+function downloadFile(url, cookie, destinationPath) {
+    return new Promise((resolve, reject) => {
+        // Parse URL
+        const parsedUrl = new URL(url);
 
-    async enqueueDownload(url, cookie, destinationPath, fileName) {
-        return new Promise((resolve, reject) => {
-            this.taskQueue.push({ url, cookie, destinationPath, fileName, resolve, reject });
-            this.dequeueDownloads();
-        });
-    }
+        // HTTP(S) module based on URL protocol
+        const httpModule = parsedUrl.protocol === 'https:' ? https : http;
 
-    async dequeueDownloads() {
-        while (this.activeDownloads < this.poolSize && this.taskQueue.length > 0) {
-            const { url, cookie, destinationPath, fileName, resolve, reject } = this.taskQueue.shift();
-            this.activeDownloads++;
-            try {
-                await this.downloadFile(url, cookie, destinationPath, fileName);
-                resolve(`File downloaded: ${fileName}`);
-            } catch (error) {
-                reject(error);
-            } finally {
-                this.activeDownloads--;
-                delete this.progress[fileName]; // Remove progress information for completed download
-                delete this.cursorPositions[fileName]; // Remove cursor position for completed download
-                this.dequeueDownloads();
-            }
-        }
-    }
+        // HTTP request options
+        const options = {
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            // headers: {
+            //     Cookie: cookie
+            // }
+        };
 
-    async downloadFile(url, cookie, destinationPath, fileName) {
-        return new Promise((resolve, reject) => {
-            // Parse URL
-            const parsedUrl = new URL(url);
-
-            // HTTP(S) module based on URL protocol
-            const httpModule = parsedUrl.protocol === 'https:' ? https : http;
-
-            // HTTP request options
-            const options = {
-                hostname: parsedUrl.hostname,
-                path: parsedUrl.pathname + parsedUrl.search,
-                headers: {
-                    Cookie: cookie
-                }
-            };
-
-            fileName = destinationPath;
-
-            // Send HTTP request
-            const request = httpModule.get(options, response => {
-                if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-                    if (response.headers.location) {
-                        this.downloadFile(response.headers.location, cookie, destinationPath, fileName)
-                            .then(resolve)
-                            .catch(reject);
-                        return;
-                    }
-                }
-
-                if (response.statusCode !== 200) {
-                    reject(`Failed to download file. HTTP Status Code: ${response.statusCode}`);
+        // Send HTTP request
+        const request = httpModule.get(options, response => {
+            // Handle redirection
+            if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+                console.log("redirected to : ", response.headers.location);
+                if (response.headers.location) {
+                    downloadFile(response.headers.location, cookie, destinationPath)
+                        .then(resolve)
+                        .catch(reject);
                     return;
                 }
+            }
 
-                // Create write stream for destination file
-                const fileStream = fs.createWriteStream(destinationPath);
+            if (response.statusCode !== 200) {
+                reject(`Failed to download file. HTTP Status Code: ${response.statusCode}`);
+                return;
+            }
 
-                // Progress variables
-                let totalSize = parseInt(response.headers['content-length'], 10);
-                let downloaded = 0;
+            // Create write stream for destination file
+            const fileStream = fs.createWriteStream(destinationPath);
 
-                // Readable stream for response body
-                const readable = new Readable().wrap(response);
+            // Progress variables
+            let totalSize = parseInt(response.headers['content-length'], 10);
+            let downloaded = 0;
 
-                // Pipe response body to file and update progress
-                readable.on('data', chunk => {
-                    downloaded += chunk.length;
+            // Progress bar
+            const progressBarLength = 50;
+            let progressBar = '';
 
-                    // Update progress information
-                    this.progress[fileName] = {
-                        downloaded,
-                        totalSize
-                    };
+            // Readable stream for response body
+            const readable = new Readable().wrap(response);
 
-                    // Update progress bar
-                    this.updateProgressBar(fileName);
-                });
+            // Pipe response body to file and update progress
+            readable.on('data', chunk => {
+                downloaded += chunk.length;
+                fileStream.write(chunk);
 
-                // Finish downloading
-                readable.on('end', () => {
-                    fileStream.end();
-                    process.stdout.write('\n'); // New line after download completes
-                    resolve();
-                });
+                // Update progress bar
+                const percent = Math.round((downloaded / totalSize) * 100);
+                const progressLength = Math.round((downloaded / totalSize) * progressBarLength);
+                progressBar = `[${'='.repeat(progressLength)}${' '.repeat(progressBarLength - progressLength)}] ${percent}% ${downloaded}/${totalSize}`;
 
-                // Error handling
-                fileStream.on('error', err => {
-                    reject(`Error writing to file: ${err}`);
-                });
-
-                readable.on('error', err => {
-                    reject(`Error reading response: ${err}`);
-                });
+                // Clear the current line and rewrite progress bar
+                process.stdout.clearLine();
+                process.stdout.cursorTo(0);
+                // process.stdout.write(url + '\n ' + progressBar);
+                process.stdout.write(progressBar);
             });
 
-            // Error handling for HTTP request
-            request.on('error', err => {
-                reject(`Error downloading file: ${err}`);
+            // Finish downloading
+            readable.on('end', () => {
+                fileStream.end();
+                process.stdout.write('\n'); // New line after progress bar
+                resolve(`File downloaded to: ${destinationPath}`);
+            });
+
+            // Error handling
+            fileStream.on('error', err => {
+                reject(`Error writing to file: ${err}`);
+            });
+
+            readable.on('error', err => {
+                reject(`Error reading response: ${err}`);
             });
         });
-    }
 
-    updateProgressBar(fileName) {
-        const progressInfo = this.progress[fileName];
-        if (!progressInfo) return;
-
-        const { downloaded, totalSize } = progressInfo;
-        const percent = Math.round((downloaded / totalSize) * 100);
-        const progressLength = Math.round((downloaded / totalSize) * 50);
-        const progressBar = `[${'='.repeat(progressLength)}${' '.repeat(50 - progressLength)}] ${percent}% - ${fileName}`;
-
-        if (!this.cursorPositions[fileName]) {
-            // Save current cursor position
-            this.cursorPositions[fileName] = process.stdout.cursorTo(0);
-            process.stdout.write(progressBar);
-        } else {
-            // Move cursor to saved position and overwrite previous progress bar
-            // this.cursorPositions[fileName].write(progressBar);
-            console.log(progressBar);
-        }
-    }
+        // Error handling for HTTP request
+        request.on('error', err => {
+            reject(`Error downloading file: ${err}`);
+        });
+    });
 }
 
 // Example usage
-const downloadPool = new DownloadPool(5);
+const url = "https://mmatechnical.com/Download/Download-Test-File/(MMA)-1GB.zip";
+const cookie = 'your_cookie_here';
+const destinationPath = './downloadedFile.zip';
 
-const tasks = [
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file1.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file2.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file3.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file4.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file5.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file5.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file6.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file7.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file8.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file9.zip' },
-    { url: 'http://speedtest.ftp.otenet.gr/files/test100Mb.db', cookie: 'your_cookie_here', destinationPath: './file10.zip' },
-    // Add more tasks as needed
-];
-
-tasks.forEach(({ url, cookie, destinationPath }) => {
-    downloadPool.enqueueDownload(url, cookie, destinationPath)
-        .then(message => console.log(message))
-        .catch(error => console.error(error));
-});
+downloadFile(url, cookie, destinationPath)
+    .then(message => console.log(message))
+    .catch(error => console.error(error));
